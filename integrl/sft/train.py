@@ -256,6 +256,8 @@ def train_sft(
 
     # Final sync
     load_policy_into_vllm_instance(policy, llm)
+    # Final save
+    _save_model_and_tokenizer(policy, tokenizer, ckpt_path)
     metrics_f.close()
     return policy, tokenizer, llm
 
