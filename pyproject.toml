@@ -20,12 +20,17 @@ dependencies = [
     "vllm==0.7.2",
     "wandb>=0.19.8",
     "xopen>=2.0.2",
+    "ipywidgets>=8.1.7",
 ]
+
+[tool.setuptools]
+packages = ["integrl"]
 
 [tool.uv]
 package = true
-no-build-isolation-package = ["flash-attn"]
-
+no-build-isolation-package = [
+    "flash-attn"
+]
 
 [tool.uv.sources]
 alpaca-eval = { git = "https://github.com/nelson-liu/alpaca_eval.git", rev = "forward_kwargs_to_vllm" }
@@ -38,3 +43,8 @@ log_cli_level = "WARNING"
 name = "flash-attn"
 version = "2.7.4.post1"
 requires-dist = ["torch", "einops", "setuptools"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+]
