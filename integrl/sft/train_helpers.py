@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from unittest import patch
+from unittest.mock import patch
 from vllm import LLM, SamplingParams
 from typing import List, Dict, Optional, Any, Callable
 from transformers import PreTrainedTokenizer, PreTrainedModel
@@ -83,7 +83,7 @@ def get_response_log_probs(
     """Compute log probs from pretrained model logits and optionally compute entropy."""
     
     # Forward pass
-    logits = model(input_ids).logits # (B, T, V)
+    logits = model(input_ids, use_cache=False).logits # (B, T, V)
     # Stable log-probs over vocab
     log_probs_vocab = torch.log_softmax(logits, dim=-1) # (B, T, V)
 

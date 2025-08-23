@@ -1,0 +1,1 @@
+step,train_loss,ema_loss,val_metric,grad_norm,tok_per_s,elapsed_s
