@@ -40,15 +40,6 @@ def read_jsonl(path: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def make_batches(n: int, batch_size: int, shuffle: bool = True, seed: int = 1709):
-    idxs = list(range(n))
-    if shuffle:
-        rnd = random.Random(seed)
-        rnd.shuffle(idxs)
-    for i in range(0, n, batch_size):
-        yield idxs[i: i + batch_size]
-
-
 HEADER = f"{'step':>8} | {'loss':>9} | {'ema':>9} | {'trainR':>9} | {'g_norm':>7} | {'tok/s':>10} | {'time':>8}"
 
 def format_row(step: int, loss_item: float, ema: float, train_reward: float, grad_norm: float, tps: float, elapsed: float) -> str:
@@ -95,25 +86,6 @@ def _repeat_by_group(xs: List[Any], group_size: int) -> List[Any]:
         out.extend([x] * group_size)
     return out
 
-def _to_float(x, default=float("nan")) -> float:
-    try:
-        if isinstance(x, torch.Tensor):
-            return float(x.item())
-        return float(x)
-    except Exception:
-        return default
-
-METRIC_COLUMNS = [
-    "step","train_loss","ema_loss","train_reward","grad_norm","tok_per_s","elapsed_s",
-    "adv_mean","adv_std",
-    "reward_mean","reward_std","reward_min","reward_max",
-    "format_reward_mean","answer_reward_mean",
-    "groups_mean_of_means","groups_mean_of_stds","groups_std_near_zero_frac",
-    "ppo_ratio_mean","ppo_ratio_std","ppo_frac_outside_clip","ppo_frac_took_clipped",
-    "tokens_response_total","tokens_response_per_example_mean",
-    "pg_variant_no_baseline","pg_variant_reinforce_with_baseline","pg_variant_grpo_clip",
-]
-
 
 def train_grpo(
     model_id: str,
@@ -123,7 +95,7 @@ def train_grpo(
     eval_device: str = "cuda:1",
     seed: int = 1709,
     # GRPO hyperparams
-    n_grpo_steps: int = 200,
+    grpo_steps: int = 200,
     learning_rate: float = 1e-5,
     advantage_eps: float = 1e-6,
     rollout_batch_size: int = 256,
@@ -170,7 +142,7 @@ def train_grpo(
     metrics_f = open(metrics_path, "a", newline="")
     metrics_writer = csv.writer(metrics_f)
     if write_header:
-        metrics_writer.writerow(METRIC_COLUMNS)
+        metrics_writer.writerow(["step","train_loss","ema_loss","train_reward","grad_norm","tok_per_s","elapsed_s"])
 
     # Load tokenizer and policy model (HF) on policy_device
     tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
@@ -208,7 +180,7 @@ def train_grpo(
     printed_header = False
     t0 = time.time()
 
-    while global_step < n_grpo_steps:
+    while global_step < grpo_steps:
         # Select prompts and repeat by group size
         # For simplicity, sample a fresh slice each step (could also shuffle/iterate)
         base_prompts, base_gts, _ = _select_prompts_and_gts(
@@ -246,7 +218,7 @@ def train_grpo(
             policy_log_probs_full = scored["log_probs"]  # (B, T)
 
         # Rewards and advantages
-        advantages, raw_rewards, rmeta = compute_group_normalized_rewards(
+        advantages, raw_rewards, _ = compute_group_normalized_rewards(
             reward_fn=r1_zero_reward_fn,
             rollout_responses=responses,
             repeated_ground_truths=ground_truths,
@@ -331,38 +303,7 @@ def train_grpo(
                     print(HEADER)
                     printed_header = True
                 print(format_row(global_step, loss_item, (running_loss or 0.0), train_reward, grad_norm_now, tps, elapsed))
-                metrics_row = {
-                    "step": global_step,
-                    "train_loss": loss_item,
-                    "ema_loss": (running_loss or 0.0),
-                    "train_reward": train_reward,
-                    "grad_norm": float(grad_norm_now),
-                    "tok_per_s": tps,
-                    "elapsed_s": elapsed,
-                    # From group-normalized rewards (rmeta)
-                    "adv_mean": _to_float(rmeta.get("advantages/mean", float("nan"))),
-                    "adv_std": _to_float(rmeta.get("advantages/std", float("nan"))),
-                    "reward_mean": _to_float(rmeta.get("reward/mean", float("nan"))),
-                    "reward_std": _to_float(rmeta.get("reward/std", float("nan"))),
-                    "reward_min": _to_float(rmeta.get("reward/min", float("nan"))),
-                    "reward_max": _to_float(rmeta.get("reward/max", float("nan"))),
-                    "format_reward_mean": _to_float(rmeta.get("format_reward/mean", float("nan"))),
-                    "answer_reward_mean": _to_float(rmeta.get("answer_reward/mean", float("nan"))),
-                    "groups_mean_of_means": _to_float(rmeta.get("groups/mean_of_means", float("nan"))),
-                    "groups_mean_of_stds": _to_float(rmeta.get("groups/mean_of_stds", float("nan"))),
-                    "groups_std_near_zero_frac": _to_float(rmeta.get("groups/std_near_zero_frac", float("nan"))),
-                    # From per-microbatch loss meta (meta)
-                    "ppo_ratio_mean": _to_float(meta.get("ppo/ratio_mean", float("nan"))),
-                    "ppo_ratio_std": _to_float(meta.get("ppo/ratio_std", float("nan"))),
-                    "ppo_frac_outside_clip": _to_float(meta.get("ppo/frac_outside_clip", float("nan"))),
-                    "ppo_frac_took_clipped": _to_float(meta.get("ppo/frac_took_clipped", float("nan"))),
-                    "tokens_response_total": _to_float(meta.get("tokens/response_total", float("nan"))),
-                    "tokens_response_per_example_mean": _to_float(meta.get("tokens/response_per_example_mean", float("nan"))),
-                    "pg_variant_no_baseline": _to_float(meta.get("pg/variant_no_baseline", 0.0)),
-                    "pg_variant_reinforce_with_baseline": _to_float(meta.get("pg/variant_reinforce_with_baseline", 0.0)),
-                    "pg_variant_grpo_clip": _to_float(meta.get("pg/variant_grpo_clip", 0.0)),
-                }
-                metrics_writer.writerow([metrics_row.get(k, float("nan")) for k in METRIC_COLUMNS])
+                metrics_writer.writerow([global_step, loss_item, (running_loss or 0.0), train_reward, float(grad_norm_now), tps, elapsed])
                 metrics_f.flush()
                 t0 = time.time()
 
@@ -390,11 +331,13 @@ def train_grpo(
                         stop=(eval_stop or ["</answer>"]),
                     )
                     sp_eval.include_stop_str_in_output = True
-                    outs_eval = llm.generate(eval_prompts, sp_eval)
                     eval_responses: List[str] = []
-                    for out in outs_eval:
-                        txt = out.outputs[0].text if out.outputs else ""
-                        eval_responses.append(txt)
+                    for i in range(0, len(eval_prompts), eval_batch_size):
+                        batch_prompts = eval_prompts[i:i + eval_batch_size]
+                        outs_eval = llm.generate(batch_prompts, sp_eval)
+                        for out in outs_eval:
+                            txt = out.outputs[0].text if out.outputs else ""
+                            eval_responses.append(txt)
 
                     # Eval rewards (accuracy proxy)
                     eval_rewards: List[float] = []
@@ -439,7 +382,7 @@ def main():
     parser.add_argument("--seed", type=int, default=1709)
 
     # GRPO hyperparams
-    parser.add_argument("--n-grpo-steps", type=int, default=200)
+    parser.add_argument("--grpo-steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--advantage-eps", type=float, default=1e-6)
     parser.add_argument("--rollout-batch-size", type=int, default=256)
@@ -456,8 +399,7 @@ def main():
         "reinforce_with_baseline",
         "grpo_clip"
     ])
-    parser.add_argument("--use-std-normalization", action="store_true")
-    parser.set_defaults(use_std_normalization=True)
+    parser.add_argument("--use-std-normalization", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cliprange", type=float, default=0.2)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
 
@@ -481,7 +423,7 @@ def main():
         policy_device=args.policy_device,
         eval_device=args.eval_device,
         seed=args.seed,
-        n_grpo_steps=args.n_grpo_steps,
+        grpo_steps=args.grpo_steps,
         learning_rate=args.lr,
         advantage_eps=args.advantage_eps,
         rollout_batch_size=args.rollout_batch_size,
