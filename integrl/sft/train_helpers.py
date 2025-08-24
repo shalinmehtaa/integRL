@@ -1,4 +1,5 @@
 import torch
+import contextlib
 from torch import Tensor
 from unittest.mock import patch
 from vllm import LLM, SamplingParams
@@ -83,18 +84,45 @@ def get_response_log_probs(
     """Compute log probs from pretrained model logits and optionally compute entropy."""
     
     # Forward pass
-    logits = model(input_ids, use_cache=False).logits # (B, T, V)
-    # Stable log-probs over vocab
-    log_probs_vocab = torch.log_softmax(logits, dim=-1) # (B, T, V)
+    logits = model(input_ids, use_cache=False).logits  # (B, T, V)
 
-    # Gather label logprobs for each position
-    log_probs_labels = torch.gather(log_probs_vocab, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)  # (B, T)
+    # Memory-efficient label log-probs: log p(y) = logits_y - logsumexp(logits)
+    label_logits = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)  # (B, T)
+    logsumexp = torch.logsumexp(logits, dim=-1)  # (B, T)
+    log_probs_labels = label_logits - logsumexp  # (B, T)
+
     out: Dict[str, Tensor] = {"log_probs": log_probs_labels}
 
     if return_token_entropy:
-        token_entropies = compute_entropy(logits)
+        token_entropies = compute_entropy(logits) # Beware: may be memory-heavy for large batches
         out["token_entropy"] = token_entropies
 
+    return out
+
+
+def get_response_log_probs_microbatched(
+    model: PreTrainedModel,
+    input_ids: Tensor,
+    labels: Tensor,
+    micro_batch_size: int,
+    return_token_entropy: Optional[bool] = False,
+    no_grad: bool = False
+) -> Dict[str, Tensor]:
+    ctx = torch.no_grad() if no_grad else contextlib.nullcontext()
+    chunks = []
+    ent_chunks = []
+    with ctx:
+        for start in range(0, input_ids.size(0), micro_batch_size):
+            end = min(start + micro_batch_size, input_ids.size(0))
+            scored = get_response_log_probs(
+                model, input_ids[start:end], labels[start:end], return_token_entropy=return_token_entropy
+            )
+            chunks.append(scored["log_probs"])
+            if return_token_entropy and "token_entropy" in scored:
+                ent_chunks.append(scored["token_entropy"])
+    out: Dict[str, Tensor] = {"log_probs": torch.cat(chunks, dim=0)}
+    if return_token_entropy and ent_chunks:
+        out["token_entropy"] = torch.cat(ent_chunks, dim=0)
     return out
 
 
