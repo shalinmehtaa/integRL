@@ -6,7 +6,7 @@ import torch
 import random
 import argparse
 from torch.optim import AdamW
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 from torch.nn.utils import clip_grad_norm_
 from vllm import SamplingParams
 from transformers import (
@@ -18,11 +18,13 @@ from transformers import (
 
 from ..grader_helpers import r1_zero_reward_fn
 from ..sft.evals import format_prompt, get_ground_truth
+from ..sft.train import make_batches
 from ..sft.train_helpers import (
     tokenize_prompt_and_output,
     get_response_log_probs,
     init_vllm,
     load_policy_into_vllm_instance,
+    get_response_log_probs_microbatched,
 )
 from .train_helpers import (
     compute_group_normalized_rewards,
@@ -40,16 +42,7 @@ def read_jsonl(path: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def make_batches(n: int, batch_size: int, shuffle: bool = True, seed: int = 1709):
-    idxs = list(range(n))
-    if shuffle:
-        rnd = random.Random(seed)
-        rnd.shuffle(idxs)
-    for i in range(0, n, batch_size):
-        yield idxs[i: i + batch_size]
-
-
-HEADER = f"{'step':>8} | {'loss':>9} | {'ema':>9} | {'trainR':>9} | {'g_norm':>7} | {'tok/s':>10} | {'time':>8}"
+HEADER = f"{'step':>8} | {'loss':>9} | {'ema':>9} | {'train_r':>9} | {'g_norm':>7} | {'tok/s':>10} | {'time':>8}"
 
 def format_row(step: int, loss_item: float, ema: float, train_reward: float, grad_norm: float, tps: float, elapsed: float) -> str:
     return f"{step:8d} | {loss_item:9.4f} | {ema:9.4f} | {train_reward:9.4f} | {float(grad_norm):7.3f} | {tps:10,.0f} | {elapsed:8.2f}s"
@@ -64,29 +57,6 @@ def _compute_grad_norm(parameters, norm_type: float = 2.0) -> float:
         param_norm = torch.linalg.vector_norm(grad, ord=norm_type)
         total += float(param_norm.item() ** 2)
     return float(total ** 0.5)
-
-
-def _select_prompts_and_gts(
-    data: List[Dict[str, Any]],
-    prompt_template: str,
-    n_prompts: int,
-) -> Tuple[List[str], List[Any], List[str]]:
-    """Return prompts (for generation), ground-truths, and question texts for logging."""
-    if not data or n_prompts <= 0:
-        return [], [], []
-    idxs = random.sample(range(len(data)), k=min(n_prompts, len(data)))
-    prompts: List[str] = []
-    gts: List[Any] = []
-    questions: List[str] = []
-    for i in idxs:
-        ex = data[i]
-        if "question" not in ex:
-            continue
-        q = ex["question"]
-        prompts.append(format_prompt(prompt_template, {"question": q}))
-        gts.append(get_ground_truth(ex))
-        questions.append(q)
-    return prompts, gts, questions
 
 
 def _repeat_by_group(xs: List[Any], group_size: int) -> List[Any]:
@@ -104,26 +74,26 @@ def train_grpo(
     eval_device: str = "cuda:1",
     seed: int = 1709,
     # GRPO hyperparams
-    n_grpo_steps: int = 200,
+    grpo_steps: int = 200,
     learning_rate: float = 1e-5,
     advantage_eps: float = 1e-6,
     rollout_batch_size: int = 256,
     group_size: int = 8,
     sampling_temperature: float = 1.0,
     sampling_min_tokens: int = 4,
-    sampling_max_tokens: int = 1024,
+    sampling_max_tokens: int = 512,
     epochs_per_rollout_batch: int = 1, # on-policy default
-    train_batch_size: int = 256, # on-policy default (== rollout_batch_size)
+    train_batch_size: int = 256, # on-policy default == rollout_batch_size
     gradient_accumulation_steps: int = 128,
     gpu_memory_utilization: float = 0.85,
-    loss_type: str = "reinforce_with_baseline", # "no_baseline" | "reinforce_with_baseline" | "grpo_clip"
+    loss_type: str = "reinforce_with_baseline",
     use_std_normalization: bool = True,
     cliprange: float = 0.2,
     max_grad_norm: float = 1.0,
-    eval_every_steps: int = 10,
-    eval_n_examples: int = 128,
-    eval_batch_size: int = 32,
-    eval_max_new_tokens: int = 1024,
+    eval_every_steps: int = 20,
+    eval_n_examples: int = 32,
+    eval_batch_size: int = 8,
+    eval_max_new_tokens: int = 512,
     eval_temperature: float = 0.0,
     eval_top_p: float = 1.0,
     eval_stop: List[str] | None = None,
@@ -131,6 +101,7 @@ def train_grpo(
     checkpoint_dir: str | None = None,
     checkpoint_every_steps: int = 0):
     torch.manual_seed(seed)
+    random.seed(seed)
 
     # Sanity asserts and constants
     assert train_batch_size % gradient_accumulation_steps == 0, \
@@ -141,7 +112,6 @@ def train_grpo(
     n_prompts_per_rollout_batch = rollout_batch_size // group_size
     assert train_batch_size >= group_size, \
         "train_batch_size must be greater than or equal to group_size"
-    n_microbatches_per_rollout_batch = rollout_batch_size // micro_train_batch_size
 
     # Metrics file
     metrics_dir = checkpoint_dir or os.getcwd()
@@ -188,16 +158,53 @@ def train_grpo(
     running_loss = None
     printed_header = False
     t0 = time.time()
-
-    while global_step < n_grpo_steps:
-        # Select prompts and repeat by group size
-        # For simplicity, sample a fresh slice each step (could also shuffle/iterate)
-        base_prompts, base_gts, _ = _select_prompts_and_gts(
-            train_rows, prompt_template, n_prompts_per_rollout_batch
+    
+    # Data iteration setup for better coverage (fixes bias issue)
+    epoch_count = 0
+    
+    def get_next_batch_data():
+        """Get next batch of training data with proper shuffling."""
+        nonlocal epoch_count
+        
+        # Create batches for the current epoch
+        batch_generator = make_batches(
+            n=len(train_rows), 
+            batch_size=n_prompts_per_rollout_batch, 
+            shuffle=True, 
+            seed=seed + epoch_count
         )
-        if not base_prompts:
+        
+        for batch_indices in batch_generator:
+            # Filter out examples without questions
+            valid_data = []
+            for idx in batch_indices:
+                ex = train_rows[idx]
+                if "question" in ex:
+                    valid_data.append(ex)
+            
+            if valid_data:
+                yield valid_data
+        
+        # Increment epoch when we've gone through all data
+        epoch_count += 1
+    
+    data_generator = get_next_batch_data()
+
+    while global_step < grpo_steps:
+        # Get next batch of data
+        try:
+            selected_data = next(data_generator)
+        except StopIteration:
+            # Start new epoch
+            data_generator = get_next_batch_data()
+            selected_data = next(data_generator)
+        
+        if not selected_data:
             print("No valid training prompts found.")
-            break
+            continue
+            
+        base_prompts = [format_prompt(prompt_template, {"question": ex["question"]}) for ex in selected_data]
+        base_gts = [get_ground_truth(ex) for ex in selected_data]
 
         prompts = _repeat_by_group(base_prompts, group_size)
         ground_truths = _repeat_by_group(base_gts, group_size)
@@ -216,15 +223,11 @@ def train_grpo(
             resp = out.outputs[0].text if out.outputs else ""
             responses.append(resp)
 
-        # Tokenize prompt+response and compute policy log-probs
+        # Tokenize prompt+response 
         toks = tokenize_prompt_and_output(prompts, responses, tokenizer)
         input_ids = toks["input_ids"].to(policy_device)
         labels = toks["labels"].to(policy_device)
         response_mask = toks["response_mask"].to(policy_device)
-
-        with torch.no_grad():
-            scored = get_response_log_probs(policy, input_ids, labels, return_token_entropy=False)
-            policy_log_probs_full = scored["log_probs"]  # (B, T)
 
         # Rewards and advantages
         advantages, raw_rewards, _ = compute_group_normalized_rewards(
@@ -235,8 +238,8 @@ def train_grpo(
             advantage_eps=advantage_eps,
             normalize_by_std=use_std_normalization,
         )
-        advantages = advantages.to(policy_log_probs_full.device)
-        raw_rewards = raw_rewards.to(policy_log_probs_full.device)
+        advantages = advantages.to(policy_device)
+        raw_rewards = raw_rewards.to(policy_device)
 
         # Disallow empty/too-short responses (count response tokens)
         if sampling_min_tokens > 0:
@@ -247,28 +250,35 @@ def train_grpo(
                 advantages[zero_mask] = 0.0
                 raw_rewards[zero_mask] = 0.0
 
-        # If GRPO-Clip, compute and cache old_log_probs once per rollout batch
-        old_log_probs_full = None
-        if loss_type == "grpo_clip":
-            with torch.no_grad():
-                old_log_probs_full = policy_log_probs_full.detach().clone()
-
         # Multiple epochs over the rollout batch (off-policy if > 1)
-        for _ in range(epochs_per_rollout_batch):
-            # Recompute current policy log probs for the batch (policy is changing across epochs)
-            scored_now = get_response_log_probs(policy, input_ids, labels, return_token_entropy=False)
-            policy_log_probs = scored_now["log_probs"]  # (B, T)
-
-            # If on-policy GRPO-Clip is weakly setup, set old_log_probs from first epoch
-            if loss_type == "grpo_clip" and old_log_probs_full is None:
+        for epoch_idx in range(epochs_per_rollout_batch):
+            # For GRPO-Clip: compute old_log_probs once per epoch to avoid memory waste
+            old_log_probs_full = None
+            if loss_type == "grpo_clip":
                 with torch.no_grad():
-                    old_log_probs_full = policy_log_probs.detach().clone()
+                    old_log_probs_full = get_response_log_probs_microbatched(
+                        policy,
+                        input_ids,
+                        labels,
+                        micro_batch_size=micro_train_batch_size,
+                        return_token_entropy=False,
+                        no_grad=True,
+                    )["log_probs"].detach().clone()
 
-            # Microbatch over rollout batch
+            # Microbatch over rollout batch; compute policy log probs per microbatch
+            microbatch_count = 0  # Track within each epoch
             for mb_start in range(0, rollout_batch_size, micro_train_batch_size):
                 mb_end = min(mb_start + micro_train_batch_size, rollout_batch_size)
 
-                mb_policy_log_probs = policy_log_probs[mb_start:mb_end]
+                # Compute fresh policy log probs for this microbatch (avoids redundant computation)
+                scored_now_mb = get_response_log_probs(
+                    policy,
+                    input_ids[mb_start:mb_end],
+                    labels[mb_start:mb_end],
+                    return_token_entropy=False
+                )
+                mb_policy_log_probs = scored_now_mb["log_probs"]  # (b, T)
+
                 mb_response_mask = response_mask[mb_start:mb_end]
                 mb_advantages = advantages[mb_start:mb_end].unsqueeze(-1)  # (b,1)
                 mb_raw_rewards = raw_rewards[mb_start:mb_end].unsqueeze(-1) # (b,1)
@@ -281,28 +291,30 @@ def train_grpo(
                     policy_log_probs=mb_policy_log_probs,
                     response_mask=mb_response_mask,
                     gradient_accumulation_steps=gradient_accumulation_steps,
-                    loss_type=loss_type,  # type: ignore[arg-type]
+                    loss_type=loss_type,
                     raw_rewards=(mb_raw_rewards if loss_type == "no_baseline" else None),
                     advantages=(mb_advantages if loss_type != "no_baseline" else None),
                     old_log_probs=mb_old_log_probs,
-                    cliprange=(cliprange if loss_type == "grpo_clip" else None),
-                )
+                    cliprange=(cliprange if loss_type == "grpo_clip" else None))
 
+                microbatch_count += 1
                 global_step += 1
-
+                
                 # Optimizer step after grad accumulation
-                if global_step % gradient_accumulation_steps == 0:
+                if microbatch_count % gradient_accumulation_steps == 0:
                     if max_grad_norm and max_grad_norm > 0:
                         clip_grad_norm_(policy.parameters(), max_grad_norm)
                     optimizer.step()
-                    policy.zero_grad(set_to_none=True)
+                    optimizer.zero_grad(set_to_none=True)
 
                 # Logging
                 loss_item = float(meta["loss/scalar_unscaled"].item())
                 running_loss = loss_item if running_loss is None else (0.95 * running_loss + 0.05 * loss_item)
                 grad_norm_now = _compute_grad_norm(policy.parameters())
                 elapsed = time.time() - t0
-                toks_this_step = int(input_ids.numel())
+                # Tokens per second for the current micro-batch only
+                mb_tokens = int((mb_end - mb_start) * input_ids.shape[1]) if input_ids.dim() == 2 else int(input_ids[mb_start:mb_end].numel())
+                toks_this_step = mb_tokens
                 tps = toks_this_step / max(1e-6, elapsed)
 
                 # Train reward (mean)
@@ -317,7 +329,7 @@ def train_grpo(
                 t0 = time.time()
 
                 # Periodic evaluation (optional)
-                if val_rows and ((global_step % eval_every_steps == 0) or (global_step == 0)):
+                if val_rows and (((eval_every_steps > 0) and (global_step % eval_every_steps == 0)) or (global_step == 0)):
                     # Sync policy weights into vLLM
                     load_policy_into_vllm_instance(policy, llm)
 
@@ -340,11 +352,13 @@ def train_grpo(
                         stop=(eval_stop or ["</answer>"]),
                     )
                     sp_eval.include_stop_str_in_output = True
-                    outs_eval = llm.generate(eval_prompts, sp_eval)
                     eval_responses: List[str] = []
-                    for out in outs_eval:
-                        txt = out.outputs[0].text if out.outputs else ""
-                        eval_responses.append(txt)
+                    for i in range(0, len(eval_prompts), eval_batch_size):
+                        batch_prompts = eval_prompts[i:i + eval_batch_size]
+                        outs_eval = llm.generate(batch_prompts, sp_eval)
+                        for out in outs_eval:
+                            txt = out.outputs[0].text if out.outputs else ""
+                            eval_responses.append(txt)
 
                     # Eval rewards (accuracy proxy)
                     eval_rewards: List[float] = []
@@ -366,12 +380,12 @@ def train_grpo(
                     print(f"Saving GRPO checkpoint to: {ckpt_path}")
                     policy.save_pretrained(save_directory=ckpt_path)
                     tokenizer.save_pretrained(save_directory=ckpt_path)
-
+            
             # End microbatches over rollout batch
-        
+
         # End epochs over rollout batch
 
-        # After finishing updates for this rollout batch, optionally refresh vLLM weights
+        # After finishing updates for this rollout batch, refresh vLLM weights
         load_policy_into_vllm_instance(policy, llm)
 
     metrics_f.close()
@@ -389,11 +403,11 @@ def main():
     parser.add_argument("--seed", type=int, default=1709)
 
     # GRPO hyperparams
-    parser.add_argument("--n-grpo-steps", type=int, default=200)
+    parser.add_argument("--grpo-steps", type=int, default=200)
     parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--advantage-eps", type=float, default=1e-6)
+    parser.add_argument("--advantage-eps", type=float, default=1e-4)
     parser.add_argument("--rollout-batch-size", type=int, default=256)
-    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("--group-size", type=int, default=4)
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
     parser.add_argument("--sampling-min-tokens", type=int, default=4)
     parser.add_argument("--sampling-max-tokens", type=int, default=1024)
@@ -406,15 +420,14 @@ def main():
         "reinforce_with_baseline",
         "grpo_clip"
     ])
-    parser.add_argument("--use-std-normalization", action="store_true")
-    parser.set_defaults(use_std_normalization=True)
+    parser.add_argument("--use-std-normalization", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cliprange", type=float, default=0.2)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
 
     # Eval / logging
-    parser.add_argument("--eval-every-steps", type=int, default=10)
-    parser.add_argument("--eval-n-examples", type=int, default=128)
-    parser.add_argument("--eval-batch-size", type=int, default=32)
+    parser.add_argument("--eval-every-steps", type=int, default=20)
+    parser.add_argument("--eval-n-examples", type=int, default=32)
+    parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--eval-max-new-tokens", type=int, default=1024)
     parser.add_argument("--eval-temperature", type=float, default=0.0)
     parser.add_argument("--eval-top-p", type=float, default=1.0)
@@ -431,7 +444,7 @@ def main():
         policy_device=args.policy_device,
         eval_device=args.eval_device,
         seed=args.seed,
-        n_grpo_steps=args.n_grpo_steps,
+        grpo_steps=args.grpo_steps,
         learning_rate=args.lr,
         advantage_eps=args.advantage_eps,
         rollout_batch_size=args.rollout_batch_size,
@@ -456,8 +469,7 @@ def main():
         eval_stop=args.eval_stop,
         eval_prompt_path=args.eval_prompt,
         checkpoint_dir=args.checkpoint_dir,
-        checkpoint_every_steps=args.checkpoint_every_steps,
-    )
+        checkpoint_every_steps=args.checkpoint_every_steps)
 
 
 if __name__ == "__main__":

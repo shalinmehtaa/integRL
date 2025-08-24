@@ -95,7 +95,7 @@ def train_sft(
     temperature: float = 0.0,
     top_p: float = 1.0,
     stop: List[str] | None = None,
-    eval_prompt_path: str = "prompts/r1_zero.prompt",
+    eval_prompt_path: str = "integrl/prompts/r1_zero.prompt",
     checkpoint_dir: str | None = None,
     checkpoint_every_steps: int = 0):
     torch.manual_seed(seed)
@@ -201,7 +201,7 @@ def train_sft(
                 policy.zero_grad(set_to_none=True)
 
             # Periodic evaluation with vLLM on eval_device
-            if val_rows and ((global_step % eval_every_steps == 0) or (global_step == 0)):
+            if val_rows and (((eval_every_steps > 0) and (global_step % eval_every_steps == 0)) or (global_step == 0)):
                 # Sync policy weights into vLLM
                 load_policy_into_vllm_instance(policy, llm)
 
@@ -257,7 +257,7 @@ def train_sft(
     # Final sync
     load_policy_into_vllm_instance(policy, llm)
     # Final save
-    _save_model_and_tokenizer(policy, tokenizer, ckpt_path)
+    _save_model_and_tokenizer(policy, tokenizer, os.path.join(checkpoint_dir, f"step-{global_step}"))
     metrics_f.close()
     return policy, tokenizer, llm
 
